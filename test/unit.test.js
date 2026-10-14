@@ -2123,3 +2123,40 @@ test("seedDesktopMcpServers: refuses external and broken config links, allows in
     assert.equal(JSON.parse(fs.readFileSync(inside, "utf8")).mcpServers.demo.env.API_KEY, "dummy");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("flippedClaudeMdExcludes: never rewrites a settings.json linked out of the profile", async () => {
+  const { flippedClaudeMdExcludes } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-flip-link-"));
+  try {
+    const def = path.join(root, ".claude"), prof = path.join(root, ".claude-work"), shared = path.join(root, "shared");
+    for (const d of [def, prof, shared]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, "CLAUDE.md"), "x"); }
+    // Settings shared between profiles through a link: the #10 restore must
+    // leave the shared file alone rather than rewrite it for every profile.
+    const target = path.join(shared, "settings.json");
+    const before = JSON.stringify({ claudeMdExcludes: [path.join(prof, "CLAUDE.md")] });
+    fs.writeFileSync(target, before);
+    fs.symlinkSync(target, path.join(prof, "settings.json"));
+    assert.deepEqual(flippedClaudeMdExcludes(path.join(prof, "settings.json"), prof, def, { apply: true }), []);
+    assert.equal(fs.readFileSync(target, "utf8"), before);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("copyExtension: refuses an extensions folder linked out of the target profile", async () => {
+  const { copyExtension } = await import("../src/commands/extensions.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-ext-link-"));
+  try {
+    const src = path.join(root, "src-ext");
+    fs.mkdirSync(src);
+    fs.writeFileSync(path.join(src, "manifest.json"), "{}");
+    const settings = path.join(root, "src-settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ apiKey: "dummy" }));
+    const ext = { id: "demo", folderPath: src, settingsPath: settings, hasSettings: true };
+    const target = path.join(root, "Claude-WORK");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(target);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(target, "Claude Extensions Settings"));
+    assert.throws(() => copyExtension(ext, target), /resolves outside the profile/);
+    assert.deepEqual(fs.readdirSync(outside), [], "nothing written through the link");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

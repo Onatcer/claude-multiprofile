@@ -276,6 +276,9 @@ export function pathsIntoOtherProfile(file, fromDir, toDir, { keys = null } = {}
 // profile, so pointing it back is safe. Returns [{ from, to }] for each entry
 // that would change; with `apply`, writes the file.
 export function flippedClaudeMdExcludes(settingsFile, profileDir, defaultDir, { apply = false } = {}) {
+  // A settings.json that is a link out of the profile (shared settings) is
+  // not this profile's to rewrite (#16), the same rule rebaseJsonFile follows.
+  if (!fileStaysWithinDir(settingsFile, profileDir)) return [];
   let settings;
   try {
     settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
