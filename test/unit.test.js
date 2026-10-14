@@ -2026,3 +2026,35 @@ test("launch helper: the click after a cut-off update recovers, opens, and the n
   assert.match(log, /updating the copy from 1\.0\.0 to 2\.0\.0[\s\S]*updated the copy from 1\.0\.0 to 2\.0\.0/, "logged before and after");
   assert.match(fs.readFileSync(path.join(clone, "Contents", "Info.plist"), "utf8"), /2\.0\.0/);
 });
+
+test("buildAliasLine: custom paths stay literal when profile commands run", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-alias-security-"));
+  try {
+    const marker = path.join(root, "unexpected");
+    const paths = [
+      `${root}/$(touch ${marker})`,
+      `${root}/quotes'\"\\dollar$HOME\`id\``,
+      `${root}/two words`,
+    ];
+    for (const shell of ["bash", "zsh", "fish"]) {
+      if (spawnSync(shell, ["--version"]).error?.code === "ENOENT") continue;
+      for (const config of paths) {
+        const gh = config + "/github";
+        const line = buildAliasLine(shell, "claude-review", config, gh);
+        const stub = shell === "fish"
+          ? 'function claude; printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" $argv; end\n'
+          : 'claude() { printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" "$@"; }\n';
+        const script = (shell === "bash" ? "shopt -s expand_aliases\n" : "") +
+          stub + line + '\neval \'claude-review "two words"\'\n';
+        const args = shell === "fish" ? ["--no-config", "-c", script] : ["-f", "-c", script];
+        const result = spawnSync(shell, args, { encoding: "utf8" });
+        assert.equal(result.status, 0, `${shell}: ${result.stderr}`);
+        assert.equal(result.stdout, `${config}\n${gh}\ntwo words\n`, shell);
+        assert.equal(fs.existsSync(marker), false, "path must not execute a command");
+      }
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
