@@ -2058,3 +2058,105 @@ test("buildAliasLine: custom paths stay literal when profile commands run", asyn
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("seedConfigDir: linked settings and plugin manifests become independent copies", async () => {
+  const { seedConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-seed-"));
+  try {
+    const { src, userCfg } = fakeClaudeHome(root);
+    const dst = path.join(root, "new-profile");
+    const files = ["settings.json", "plugins/installed_plugins.json", "plugins/known_marketplaces.json"];
+    fs.writeFileSync(path.join(src, files[2]), JSON.stringify({ market: { installLocation: `${src}/plugins/cache/p/1.0.0` } }));
+    for (const [i, rel] of files.entries()) {
+      const file = path.join(src, rel), shared = path.join(root, `shared-${i}.json`);
+      fs.renameSync(file, shared);
+      fs.symlinkSync(shared, file);
+    }
+    const before = files.map((rel) => fs.readFileSync(path.join(src, rel), "utf8"));
+    seedConfigDir(src, dst, { userConfigFile: userCfg });
+    files.forEach((rel, i) => {
+      assert.equal(fs.readFileSync(path.join(src, rel), "utf8"), before[i], "source must stay unchanged");
+      assert.equal(fs.lstatSync(path.join(dst, rel)).isSymbolicLink(), false);
+      assert.ok(fs.readFileSync(path.join(dst, rel), "utf8").includes(dst), "new copy must be rebased");
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rebaseJsonFile: external file and parent-directory symlinks are left untouched", async () => {
+  const { rebaseJsonFile } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-rebase-"));
+  try {
+    const src = path.join(root, "source"), dst = path.join(root, "profile"), outside = path.join(root, "outside");
+    for (const dir of [src, dst, outside]) fs.mkdirSync(dir);
+    fs.mkdirSync(path.join(dst, "hooks")); fs.writeFileSync(path.join(dst, "hooks/a.sh"), "fixture");
+    const file = path.join(outside, "settings.json");
+    const before = JSON.stringify({ hooks: `${src}/hooks/a.sh` }); fs.writeFileSync(file, before);
+    fs.symlinkSync(file, path.join(dst, "settings.json"));
+    fs.symlinkSync(outside, path.join(dst, "plugins"));
+    for (const target of [path.join(dst, "settings.json"), path.join(dst, "plugins/settings.json")]) {
+      assert.equal(rebaseJsonFile(target, src, dst), false);
+      assert.equal(fs.readFileSync(file, "utf8"), before);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("seedDesktopMcpServers: refuses external and broken config links, allows internal links", async () => {
+  const { seedDesktopMcpServers, desktopConfigFile } = await import("../src/desktop.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-mcp-"));
+  try {
+    const dataDir = path.join(root, "profile"); fs.mkdirSync(dataDir);
+    const outside = path.join(root, "outside.json"); fs.writeFileSync(outside, "{}");
+    const sourceFile = fakeDesktopSource(root, { demo: { command: "demo", env: { API_KEY: "dummy" } } });
+    const config = desktopConfigFile(dataDir);
+    for (const target of [outside, path.join(root, "missing.json")]) {
+      fs.symlinkSync(target, config);
+      const result = seedDesktopMcpServers(dataDir, { sourceFile });
+      assert.equal(result.status, "foreign");
+      assert.equal(result.reason, "unsafe-path");
+      assert.equal(fs.readFileSync(outside, "utf8"), "{}");
+      assert.equal(fs.existsSync(path.join(root, "missing.json")), false);
+      fs.unlinkSync(config);
+    }
+    const inside = path.join(dataDir, "internal.json"); fs.writeFileSync(inside, "{}");
+    fs.symlinkSync(inside, config);
+    assert.equal(seedDesktopMcpServers(dataDir, { sourceFile }).status, "seeded");
+    assert.equal(JSON.parse(fs.readFileSync(inside, "utf8")).mcpServers.demo.env.API_KEY, "dummy");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("flippedClaudeMdExcludes: never rewrites a settings.json linked out of the profile", async () => {
+  const { flippedClaudeMdExcludes } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-flip-link-"));
+  try {
+    const def = path.join(root, ".claude"), prof = path.join(root, ".claude-work"), shared = path.join(root, "shared");
+    for (const d of [def, prof, shared]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, "CLAUDE.md"), "x"); }
+    // Settings shared between profiles through a link: the #10 restore must
+    // leave the shared file alone rather than rewrite it for every profile.
+    const target = path.join(shared, "settings.json");
+    const before = JSON.stringify({ claudeMdExcludes: [path.join(prof, "CLAUDE.md")] });
+    fs.writeFileSync(target, before);
+    fs.symlinkSync(target, path.join(prof, "settings.json"));
+    assert.deepEqual(flippedClaudeMdExcludes(path.join(prof, "settings.json"), prof, def, { apply: true }), []);
+    assert.equal(fs.readFileSync(target, "utf8"), before);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("copyExtension: refuses an extensions folder linked out of the target profile", async () => {
+  const { copyExtension } = await import("../src/commands/extensions.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-ext-link-"));
+  try {
+    const src = path.join(root, "src-ext");
+    fs.mkdirSync(src);
+    fs.writeFileSync(path.join(src, "manifest.json"), "{}");
+    const settings = path.join(root, "src-settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ apiKey: "dummy" }));
+    const ext = { id: "demo", folderPath: src, settingsPath: settings, hasSettings: true };
+    const target = path.join(root, "Claude-WORK");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(target);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(target, "Claude Extensions Settings"));
+    assert.throws(() => copyExtension(ext, target), /resolves outside the profile/);
+    assert.deepEqual(fs.readdirSync(outside), [], "nothing written through the link");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
