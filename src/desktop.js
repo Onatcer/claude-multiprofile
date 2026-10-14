@@ -273,9 +273,19 @@ export function buildLaunchAppleScript(dataDir, claudeAppPath, codeConfigDir, gh
   if (ghConfigDir) openArgs.push("--env", `GH_CONFIG_DIR=${ghConfigDir}`);
   openArgs.push("--args", `--user-data-dir=${dataDir}`);
   const helperArgs = [claudeAppPath, helper.source, helper.hue || "", dataDir, helper.label, ...openArgs];
+  // The launcher WAITS for the helper (no trailing `&`), and that is
+  // load-bearing (#13). On macOS 27, about a second after an app quits,
+  // loginwindow force-quits every process that app is responsible for
+  // ("force quit (caller responsible for termination)"). The helper is one of
+  // them, being started by the launcher, so a launcher that started it in the
+  // background and quit at once had it killed mid-update: a half-made copy
+  // left behind, no log line, nothing opened. Waiting keeps the launcher
+  // alive until the helper has finished and Claude is open. Claude itself is
+  // started through LaunchServices by `open`, so it is not the launcher's to
+  // take down.
   const cmd =
     `if [ -f ${shellQuote(helper.path)} ]; then ` +
-    `/usr/bin/osascript -l JavaScript ${shellQuote(helper.path)} ${helperArgs.map(shellQuote).join(" ")} > /dev/null 2>&1 & ` +
+    `/usr/bin/osascript -l JavaScript ${shellQuote(helper.path)} ${helperArgs.map(shellQuote).join(" ")} > /dev/null 2>&1; ` +
     `else ${openLine} fi`;
   return `do shell script ${appleScriptString(cmd)}`;
 }
@@ -290,6 +300,16 @@ export function launcherUsesHelper(appPath) {
   const src = readLauncherScript(appPath);
   if (src === null) return undefined;
   return src.includes("claude-multiprofile/bin/launch.js");
+}
+
+// Whether a helper-using launcher waits for the helper rather than starting
+// it in the background. Launchers built before v0.1.34 background it, and on
+// macOS 27 that gets the helper killed part-way through an update (#13).
+// Returns undefined when the script cannot be read or uses no helper.
+export function launcherWaitsForHelper(appPath) {
+  const src = readLauncherScript(appPath);
+  if (src === null || !src.includes("claude-multiprofile/bin/launch.js")) return undefined;
+  return !/2>&1 & else /.test(src);
 }
 
 // Wrap a value in shell single quotes, escaping embedded apostrophes the POSIX
