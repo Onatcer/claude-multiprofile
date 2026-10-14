@@ -148,6 +148,8 @@ Since v0.1.29, profiles are updated differently:
 
 The launcher's work is done by a small helper at `~/Library/Application Support/claude-multiprofile/bin/launch.js`. It runs with `osascript`, which ships with macOS, because apps started from the Dock do not get your shell's `PATH` and so cannot rely on Node. Its log is `launch.log` in the same folder, and `doctor` reports any errors from it.
 
+The launcher waits for the helper to finish before it quits. On macOS 27, about a second after an app quits, macOS force-quits every process that app started, and launchers before v0.1.34 started the helper in the background and quit at once, so an update could be cut off part-way: nothing opened, and a half-made copy was left behind ([#13](https://github.com/jmdarre-v/claude-multiprofile/issues/13)). If an update does get cut off, the helper logs it before starting, the next click puts things back and opens the profile, and the click after that finishes the update; `doctor` reports it, and `doctor --fix` cleans up. Upgrading rebuilds existing launchers in place.
+
 Two things to know:
 
 - **The Code tab in Claude Desktop is pinned the same way.** Desktop keeps its own copy of Claude Code per profile and updates it with the same policy, so a profile's Code tab moves forward when its copy is rebuilt. The `claude-<name>` command in your terminal is unaffected: it runs your npm-installed `claude`.
