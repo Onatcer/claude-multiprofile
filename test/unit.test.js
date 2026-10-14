@@ -1927,3 +1927,102 @@ test("doctor: a copy that is behind is information when its launcher updates it,
   assert.match(section, /⚠ direct: copy is Claude 1\.0\.0, but 2\.0\.0 is installed/);
   assert.match(section, /Nothing updates it on its own/);
 });
+
+// ---------------------------------------------------------------------------
+// #13 - macOS 27 force-quits what a quitting launcher started
+// ---------------------------------------------------------------------------
+//
+// On macOS 27, about a second after an app quits, loginwindow force-quits
+// every process that app is responsible for. A launcher that started the
+// helper in the background and quit had it killed part-way through an update.
+// Reproduced and fixed through a real launcher click on 27.0.1.
+
+test("buildLaunchAppleScript: the launcher waits for the helper instead of backgrounding it", async () => {
+  const { buildLaunchAppleScript } = await import("../src/desktop.js");
+  const helper = { path: "/x/claude-multiprofile/bin/launch.js", source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const s = buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper);
+  assert.match(s, /2>&1; else /, "the helper runs in the foreground");
+  assert.doesNotMatch(s, /launch\.js[^\n]*2>&1 & else /, "never in the background");
+});
+
+test("launcherWaitsForHelper: tells a pre-0.1.34 launcher from a current one", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osacompile is macOS only");
+    return;
+  }
+  const { buildLaunchAppleScript, launcherWaitsForHelper } = await import("../src/desktop.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-wait-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = { path: path.join(root, "claude-multiprofile", "bin", "launch.js"), source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const compile = (name, script) => {
+    const src = path.join(root, `${name}.applescript`);
+    fs.writeFileSync(src, script);
+    execFileSync("/usr/bin/osacompile", ["-o", path.join(root, `${name}.app`), src], { stdio: "pipe" });
+    return path.join(root, `${name}.app`);
+  };
+  const current = compile("Current", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper));
+  // What v0.1.29 to v0.1.33 generated: the same call, backgrounded.
+  const old = compile("Old", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper).replace("2>&1; else ", "2>&1 & else "));
+  const legacy = compile("Legacy", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true));
+  assert.equal(launcherWaitsForHelper(current), true);
+  assert.equal(launcherWaitsForHelper(old), false);
+  assert.equal(launcherWaitsForHelper(legacy), undefined, "no helper, nothing to wait for");
+});
+
+test("unfinishedRefresh and refreshLeftovers: what a cut-off update leaves for doctor", async () => {
+  const { unfinishedRefresh, refreshLeftovers } = await import("../src/launchhelper.js");
+  const e = (label, message) => ({ at: 0, label, level: "INFO", message });
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2")]).message, "updating the copy from 1 to 2");
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "updated the copy from 1 to 2")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "could not update the copy from 1 to 2: x")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude X", "updating the copy from 1 to 2")]), null, "per launcher");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-left-"));
+  const clone = path.join(root, "Claude w.app");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+  assert.deepEqual(refreshLeftovers(clone), [clone + ".refreshing"]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("launch helper: the click after a cut-off update recovers, opens, and the next one updates", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osascript is macOS only");
+    return;
+  }
+  const { HELPER_JS } = await import("../src/launchhelper.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-recover-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = path.join(root, "launch.js");
+  fs.writeFileSync(helper, HELPER_JS);
+  const logFile = path.join(root, "launch.log");
+  const fakeApp = (dir, version) => {
+    fs.mkdirSync(path.join(dir, "Contents"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "Contents", "Info.plist"),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleShortVersionString</key><string>${version}</string></dict></plist>`);
+  };
+  const source = path.join(root, "Source.app");
+  fakeApp(source, "2.0.0");
+  const clone = path.join(root, "Claude w.app");
+  // The worst cut: between the two moves. The copy is not at its own path,
+  // the previous one is beside it, and a half-made new one too.
+  fakeApp(clone + ".previous", "1.0.0");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+
+  const click = () => execFileSync("/usr/bin/osascript", ["-l", "JavaScript", helper, clone, source, "", path.join(root, "data"), "Claude W", "-a", clone],
+    { encoding: "utf8", env: { ...process.env, CMP_LAUNCH_LOG: logFile } }).trim();
+
+  assert.equal(click(), "opened");
+  assert.equal(fs.existsSync(path.join(clone, "Contents", "Info.plist")), true, "the copy is back at its path");
+  assert.equal(fs.existsSync(clone + ".refreshing"), false);
+  assert.equal(fs.existsSync(clone + ".previous"), false);
+  let log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /put the previous copy back/);
+  assert.match(log, /opening 1\.0\.0 this time/, "this click does not retry");
+
+  click();
+  log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /updating the copy from 1\.0\.0 to 2\.0\.0[\s\S]*updated the copy from 1\.0\.0 to 2\.0\.0/, "logged before and after");
+  assert.match(fs.readFileSync(path.join(clone, "Contents", "Info.plist"), "utf8"), /2\.0\.0/);
+});
