@@ -1927,3 +1927,271 @@ test("doctor: a copy that is behind is information when its launcher updates it,
   assert.match(section, /⚠ direct: copy is Claude 1\.0\.0, but 2\.0\.0 is installed/);
   assert.match(section, /Nothing updates it on its own/);
 });
+
+// ---------------------------------------------------------------------------
+// #13 - macOS 27 force-quits what a quitting launcher started
+// ---------------------------------------------------------------------------
+//
+// On macOS 27, about a second after an app quits, loginwindow force-quits
+// every process that app is responsible for. A launcher that started the
+// helper in the background and quit had it killed part-way through an update.
+// Reproduced and fixed through a real launcher click on 27.0.1.
+
+test("buildLaunchAppleScript: the launcher waits for the helper instead of backgrounding it", async () => {
+  const { buildLaunchAppleScript } = await import("../src/desktop.js");
+  const helper = { path: "/x/claude-multiprofile/bin/launch.js", source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const s = buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper);
+  assert.match(s, /2>&1; else /, "the helper runs in the foreground");
+  assert.doesNotMatch(s, /launch\.js[^\n]*2>&1 & else /, "never in the background");
+});
+
+test("launcherWaitsForHelper: tells a pre-0.1.34 launcher from a current one", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osacompile is macOS only");
+    return;
+  }
+  const { buildLaunchAppleScript, launcherWaitsForHelper } = await import("../src/desktop.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-wait-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = { path: path.join(root, "claude-multiprofile", "bin", "launch.js"), source: "/Applications/Claude.app", hue: "", label: "Claude W" };
+  const compile = (name, script) => {
+    const src = path.join(root, `${name}.applescript`);
+    fs.writeFileSync(src, script);
+    execFileSync("/usr/bin/osacompile", ["-o", path.join(root, `${name}.app`), src], { stdio: "pipe" });
+    return path.join(root, `${name}.app`);
+  };
+  const current = compile("Current", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper));
+  // What v0.1.29 to v0.1.33 generated: the same call, backgrounded.
+  const old = compile("Old", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true, helper).replace("2>&1; else ", "2>&1 & else "));
+  const legacy = compile("Legacy", buildLaunchAppleScript("/d", "/x/apps/Claude w.app", null, null, true));
+  assert.equal(launcherWaitsForHelper(current), true);
+  assert.equal(launcherWaitsForHelper(old), false);
+  assert.equal(launcherWaitsForHelper(legacy), undefined, "no helper, nothing to wait for");
+});
+
+test("unfinishedRefresh and refreshLeftovers: what a cut-off update leaves for doctor", async () => {
+  const { unfinishedRefresh, refreshLeftovers } = await import("../src/launchhelper.js");
+  const e = (label, message) => ({ at: 0, label, level: "INFO", message });
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2")]).message, "updating the copy from 1 to 2");
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "updated the copy from 1 to 2")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude W", "updating the copy from 1 to 2"), e("Claude W", "could not update the copy from 1 to 2: x")]), null);
+  assert.equal(unfinishedRefresh("Claude W", [e("Claude X", "updating the copy from 1 to 2")]), null, "per launcher");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-left-"));
+  const clone = path.join(root, "Claude w.app");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+  assert.deepEqual(refreshLeftovers(clone), [clone + ".refreshing"]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("launch helper: the click after a cut-off update recovers, opens, and the next one updates", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("osascript is macOS only");
+    return;
+  }
+  const { HELPER_JS } = await import("../src/launchhelper.js");
+  const { execFileSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-recover-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = path.join(root, "launch.js");
+  fs.writeFileSync(helper, HELPER_JS);
+  const logFile = path.join(root, "launch.log");
+  const fakeApp = (dir, version) => {
+    fs.mkdirSync(path.join(dir, "Contents"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "Contents", "Info.plist"),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleShortVersionString</key><string>${version}</string></dict></plist>`);
+  };
+  const source = path.join(root, "Source.app");
+  fakeApp(source, "2.0.0");
+  const clone = path.join(root, "Claude w.app");
+  // The worst cut: between the two moves. The copy is not at its own path,
+  // the previous one is beside it, and a half-made new one too.
+  fakeApp(clone + ".previous", "1.0.0");
+  fs.mkdirSync(clone + ".refreshing", { recursive: true });
+
+  const click = () => execFileSync("/usr/bin/osascript", ["-l", "JavaScript", helper, clone, source, "", path.join(root, "data"), "Claude W", "-a", clone],
+    { encoding: "utf8", env: { ...process.env, CMP_LAUNCH_LOG: logFile } }).trim();
+
+  assert.equal(click(), "opened");
+  assert.equal(fs.existsSync(path.join(clone, "Contents", "Info.plist")), true, "the copy is back at its path");
+  assert.equal(fs.existsSync(clone + ".refreshing"), false);
+  assert.equal(fs.existsSync(clone + ".previous"), false);
+  let log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /put the previous copy back/);
+  assert.match(log, /opening 1\.0\.0 this time/, "this click does not retry");
+
+  click();
+  log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /updating the copy from 1\.0\.0 to 2\.0\.0[\s\S]*updated the copy from 1\.0\.0 to 2\.0\.0/, "logged before and after");
+  assert.match(fs.readFileSync(path.join(clone, "Contents", "Info.plist"), "utf8"), /2\.0\.0/);
+});
+
+test("buildAliasLine: custom paths stay literal when profile commands run", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-alias-security-"));
+  try {
+    const marker = path.join(root, "unexpected");
+    const paths = [
+      `${root}/$(touch ${marker})`,
+      `${root}/quotes'\"\\dollar$HOME\`id\``,
+      `${root}/two words`,
+    ];
+    for (const shell of ["bash", "zsh", "fish"]) {
+      if (spawnSync(shell, ["--version"]).error?.code === "ENOENT") continue;
+      for (const config of paths) {
+        const gh = config + "/github";
+        const line = buildAliasLine(shell, "claude-review", config, gh);
+        const stub = shell === "fish"
+          ? 'function claude; printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" $argv; end\n'
+          : 'claude() { printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$GH_CONFIG_DIR" "$@"; }\n';
+        const script = (shell === "bash" ? "shopt -s expand_aliases\n" : "") +
+          stub + line + '\neval \'claude-review "two words"\'\n';
+        const args = shell === "fish" ? ["--no-config", "-c", script] : ["-f", "-c", script];
+        const result = spawnSync(shell, args, { encoding: "utf8" });
+        assert.equal(result.status, 0, `${shell}: ${result.stderr}`);
+        assert.equal(result.stdout, `${config}\n${gh}\ntwo words\n`, shell);
+        assert.equal(fs.existsSync(marker), false, "path must not execute a command");
+      }
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("seedConfigDir: linked settings and plugin manifests become independent copies", async () => {
+  const { seedConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-seed-"));
+  try {
+    const { src, userCfg } = fakeClaudeHome(root);
+    const dst = path.join(root, "new-profile");
+    const files = ["settings.json", "plugins/installed_plugins.json", "plugins/known_marketplaces.json"];
+    fs.writeFileSync(path.join(src, files[2]), JSON.stringify({ market: { installLocation: `${src}/plugins/cache/p/1.0.0` } }));
+    for (const [i, rel] of files.entries()) {
+      const file = path.join(src, rel), shared = path.join(root, `shared-${i}.json`);
+      fs.renameSync(file, shared);
+      fs.symlinkSync(shared, file);
+    }
+    const before = files.map((rel) => fs.readFileSync(path.join(src, rel), "utf8"));
+    seedConfigDir(src, dst, { userConfigFile: userCfg });
+    files.forEach((rel, i) => {
+      assert.equal(fs.readFileSync(path.join(src, rel), "utf8"), before[i], "source must stay unchanged");
+      assert.equal(fs.lstatSync(path.join(dst, rel)).isSymbolicLink(), false);
+      assert.ok(fs.readFileSync(path.join(dst, rel), "utf8").includes(dst), "new copy must be rebased");
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rebaseJsonFile: external file and parent-directory symlinks are left untouched", async () => {
+  const { rebaseJsonFile } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-rebase-"));
+  try {
+    const src = path.join(root, "source"), dst = path.join(root, "profile"), outside = path.join(root, "outside");
+    for (const dir of [src, dst, outside]) fs.mkdirSync(dir);
+    fs.mkdirSync(path.join(dst, "hooks")); fs.writeFileSync(path.join(dst, "hooks/a.sh"), "fixture");
+    const file = path.join(outside, "settings.json");
+    const before = JSON.stringify({ hooks: `${src}/hooks/a.sh` }); fs.writeFileSync(file, before);
+    fs.symlinkSync(file, path.join(dst, "settings.json"));
+    fs.symlinkSync(outside, path.join(dst, "plugins"));
+    for (const target of [path.join(dst, "settings.json"), path.join(dst, "plugins/settings.json")]) {
+      assert.equal(rebaseJsonFile(target, src, dst), false);
+      assert.equal(fs.readFileSync(file, "utf8"), before);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("seedDesktopMcpServers: refuses external and broken config links, allows internal links", async () => {
+  const { seedDesktopMcpServers, desktopConfigFile } = await import("../src/desktop.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-linked-mcp-"));
+  try {
+    const dataDir = path.join(root, "profile"); fs.mkdirSync(dataDir);
+    const outside = path.join(root, "outside.json"); fs.writeFileSync(outside, "{}");
+    const sourceFile = fakeDesktopSource(root, { demo: { command: "demo", env: { API_KEY: "dummy" } } });
+    const config = desktopConfigFile(dataDir);
+    for (const target of [outside, path.join(root, "missing.json")]) {
+      fs.symlinkSync(target, config);
+      const result = seedDesktopMcpServers(dataDir, { sourceFile });
+      assert.equal(result.status, "foreign");
+      assert.equal(result.reason, "unsafe-path");
+      assert.equal(fs.readFileSync(outside, "utf8"), "{}");
+      assert.equal(fs.existsSync(path.join(root, "missing.json")), false);
+      fs.unlinkSync(config);
+    }
+    const inside = path.join(dataDir, "internal.json"); fs.writeFileSync(inside, "{}");
+    fs.symlinkSync(inside, config);
+    assert.equal(seedDesktopMcpServers(dataDir, { sourceFile }).status, "seeded");
+    assert.equal(JSON.parse(fs.readFileSync(inside, "utf8")).mcpServers.demo.env.API_KEY, "dummy");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("flippedClaudeMdExcludes: never rewrites a settings.json linked out of the profile", async () => {
+  const { flippedClaudeMdExcludes } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-flip-link-"));
+  try {
+    const def = path.join(root, ".claude"), prof = path.join(root, ".claude-work"), shared = path.join(root, "shared");
+    for (const d of [def, prof, shared]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, "CLAUDE.md"), "x"); }
+    // Settings shared between profiles through a link: the #10 restore must
+    // leave the shared file alone rather than rewrite it for every profile.
+    const target = path.join(shared, "settings.json");
+    const before = JSON.stringify({ claudeMdExcludes: [path.join(prof, "CLAUDE.md")] });
+    fs.writeFileSync(target, before);
+    fs.symlinkSync(target, path.join(prof, "settings.json"));
+    assert.deepEqual(flippedClaudeMdExcludes(path.join(prof, "settings.json"), prof, def, { apply: true }), []);
+    assert.equal(fs.readFileSync(target, "utf8"), before);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("copyExtension: refuses an extensions folder linked out of the target profile", async () => {
+  const { copyExtension } = await import("../src/commands/extensions.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-ext-link-"));
+  try {
+    const src = path.join(root, "src-ext");
+    fs.mkdirSync(src);
+    fs.writeFileSync(path.join(src, "manifest.json"), "{}");
+    const settings = path.join(root, "src-settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ apiKey: "dummy" }));
+    const ext = { id: "demo", folderPath: src, settingsPath: settings, hasSettings: true };
+    const target = path.join(root, "Claude-WORK");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(target);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(target, "Claude Extensions Settings"));
+    assert.throws(() => copyExtension(ext, target), /resolves outside the profile/);
+    assert.deepEqual(fs.readdirSync(outside), [], "nothing written through the link");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("ensureConfigDir: new empty profiles are private even with a permissive umask", async () => {
+  const { ensureConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-private-profile-"));
+  const previous = process.umask(0);
+  try {
+    const dst = path.join(root, "profile");
+    ensureConfigDir(dst);
+    assert.equal(fs.statSync(dst).mode & 0o777, 0o700);
+  } finally {
+    process.umask(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("seedConfigDir: copied MCP credentials and the new profile are owner-only", async () => {
+  const { seedConfigDir } = await import("../src/code.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cmp-private-seed-"));
+  const previous = process.umask(0);
+  try {
+    const { src, userCfg } = fakeClaudeHome(root);
+    const servers = { github: { command: "demo", env: { GITHUB_TOKEN: "dummy-personal-token" } } };
+    fs.writeFileSync(userCfg, JSON.stringify({ mcpServers: servers }));
+    const dst = path.join(root, "profile");
+    seedConfigDir(src, dst, { userConfigFile: userCfg });
+    assert.equal(fs.statSync(dst).mode & 0o777, 0o700);
+    const file = path.join(dst, ".claude.json");
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).mcpServers, servers,
+      "intentional credential copying must still work");
+  } finally {
+    process.umask(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

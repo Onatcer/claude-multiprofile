@@ -148,6 +148,8 @@ Since v0.1.29, profiles are updated differently:
 
 The launcher's work is done by a small helper at `~/Library/Application Support/claude-multiprofile/bin/launch.js`. It runs with `osascript`, which ships with macOS, because apps started from the Dock do not get your shell's `PATH` and so cannot rely on Node. Its log is `launch.log` in the same folder, and `doctor` reports any errors from it.
 
+The launcher waits for the helper to finish before it quits. On macOS 27, about a second after an app quits, macOS force-quits every process that app started, and launchers before v0.1.34 started the helper in the background and quit at once, so an update could be cut off part-way: nothing opened, and a half-made copy was left behind ([#13](https://github.com/jmdarre-v/claude-multiprofile/issues/13)). If an update does get cut off, the helper logs it before starting, the next click puts things back and opens the profile, and the click after that finishes the update; `doctor` reports it, and `doctor --fix` cleans up. Upgrading rebuilds existing launchers in place.
+
 Two things to know:
 
 - **The Code tab in Claude Desktop is pinned the same way.** Desktop keeps its own copy of Claude Code per profile and updates it with the same policy, so a profile's Code tab moves forward when its copy is rebuilt. The `claude-<name>` command in your terminal is unaffected: it runs your npm-installed `claude`.
@@ -487,7 +489,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md). Please don't open a p
 - `~/Library/Application Support/Claude-{NAME}-3p/`: the setting that stops that profile's copy of Claude updating itself. Only written when the folder does not exist, because Claude also keeps third-party inference setups there; never edited if the tool did not create it.
 - `~/Library/Application Support/claude-multiprofile/`: each profile's copy of Claude.app (`apps/`, APFS clones carrying the colour as Finder metadata), the launch helper (`bin/launch.js`) and its log (`launch.log`).
 - `~/Applications/Claude {NAME}.app`: each profile's launcher, created new, and registered with macOS LaunchServices.
-- `~/.claude-{name}/`: each Code profile's config folder. When you choose to seed it, the tool copies setup from `~/.claude` from an allowlist, and the `mcpServers` entry of `~/.claude.json`, and points paths in plugin manifests and settings at the profile's own copies. It adds cross-profile `permissions.deny` rules to `settings.json`, tracking only the rules it wrote and never removing yours. With GitHub CLI isolation on, `gh/` inside it holds that profile's `gh` login.
+- `~/.claude-{name}/`: each Code profile's config folder, created with owner-only permissions. When you choose to seed it, the tool copies setup from `~/.claude` from an allowlist, and the `mcpServers` entry of `~/.claude.json` (written with owner-only permissions), including any API keys or tokens in those settings and servers after explicit confirmation, and points paths in plugin manifests and settings at the profile's own copies. It adds cross-profile `permissions.deny` rules to `settings.json`, tracking only the rules it wrote and never removing yours. With GitHub CLI isolation on, `gh/` inside it holds that profile's `gh` login.
 - `~/.zshrc`, `~/.bash_profile` or `~/.config/fish/config.fish`: a delimited managed block of aliases. Lines outside the markers are never touched.
 - `~/.config/claude-multiprofile/`: the registry (`profiles.json`, with a `.bak` of the last good version) and `state.json`, which records which version's fixes have been applied.
 

@@ -39,6 +39,7 @@ import {
   compileApp,
   launchTargetFor,
   launcherUsesHelper,
+  launcherWaitsForHelper,
   copyClaudeIcon,
   findClaudeApp,
   DEFAULT_APPLET_BUNDLE_ID,
@@ -69,7 +70,15 @@ import { resyncDenyRules, auditDenyRules, readProtectionEnabled } from "../permi
 import { updateBlockState, blockUpdates, wantsUpdateBlock } from "../updates.js";
 import { recordFixPass } from "../state.js";
 import { takeSnapshot, finishSnapshot, fixTargets, undoLatest } from "../snapshot.js";
-import { helperState, installHelper, recentLaunchLog, HELPER_PATH, LAUNCH_LOG } from "../launchhelper.js";
+import {
+  helperState,
+  installHelper,
+  recentLaunchLog,
+  unfinishedRefresh,
+  refreshLeftovers,
+  HELPER_PATH,
+  LAUNCH_LOG,
+} from "../launchhelper.js";
 import { detectShell, rcPathForShell, readManagedAliases } from "../shell.js";
 import {
   HOME,
@@ -1028,9 +1037,14 @@ function checkManagedUpdates(t, reg, fix) {
   // The helper every managed launcher calls.
   const hs = helperState();
   if (hs !== "current") {
-    warn(hs === "missing" ? "The launch helper is not installed." : "The launch helper is out of date.");
-    info("  Launchers still open Claude without it, but copies are not kept current");
-    info("  and a profile open on the wrong account is not caught.");
+    if (hs === "missing") {
+      warn("The launch helper is not installed.");
+      info("  Launchers still open Claude without it, but copies are not kept current");
+      info("  and a profile open on the wrong account is not caught.");
+    } else {
+      warn("The launch helper is an older version than this release ships.");
+      info("  It still works; the newer one is what this release's fixes rely on.");
+    }
     if (fix) {
       try {
         installHelper();
@@ -1046,9 +1060,20 @@ function checkManagedUpdates(t, reg, fix) {
   }
 
   for (const p of withCopies) {
-    // Launchers built before v0.1.29 open the copy directly.
-    if (fileExists(p.desktop.appPath) && launcherUsesHelper(p.desktop.appPath) === false) {
-      warn(`${p.name}: its launcher opens the copy directly, without the helper.`);
+    // Launchers built before v0.1.29 open the copy directly. Launchers built
+    // before v0.1.34 start the helper in the background and quit, and on
+    // macOS 27 that gets the helper force-quit part-way through an update
+    // (#13). Both are rebuilt in place.
+    const usesHelper = fileExists(p.desktop.appPath) ? launcherUsesHelper(p.desktop.appPath) : undefined;
+    const waits = usesHelper ? launcherWaitsForHelper(p.desktop.appPath) : undefined;
+    if (usesHelper === false || waits === false) {
+      if (usesHelper === false) {
+        warn(`${p.name}: its launcher opens the copy directly, without the helper.`);
+      } else {
+        warn(`${p.name}: its launcher starts the helper and quits without waiting for it.`);
+        info("  On macOS 27 that cuts an update off part-way: nothing opens, and a");
+        info("  half-made copy is left behind.");
+      }
       if (fix) {
         try {
           compileApp({
@@ -1067,6 +1092,34 @@ function checkManagedUpdates(t, reg, fix) {
         }
       } else {
         info(`  Repair with ${command("claude-multiprofile doctor --fix")}`);
+        t.warnings++;
+      }
+    }
+
+    // An update a launcher started and never finished. The helper logs
+    // before it starts, so a run that was killed part-way leaves that line
+    // with nothing after it, and usually a folder beside the copy.
+    const clonePath = clonePathFor(p.name);
+    const leftovers = refreshLeftovers(clonePath);
+    const unfinished = unfinishedRefresh(path.basename(p.desktop.appPath, ".app"));
+    if (leftovers.length > 0 || unfinished) {
+      warn(`${p.name}: an update of its copy was cut off part-way${unfinished ? ` (${unfinished.message.replace(/^updating the copy /, "")}, at ${new Date(unfinished.at).toLocaleString()})` : ""}.`);
+      if (leftovers.length > 0) info(`  It left ${leftovers.map((x) => path.basename(x)).join(" and ")} behind.`);
+      if (fix && !cloneIsRunning(clonePath)) {
+        try {
+          if (!fileExists(clonePath) && fileExists(clonePath + ".previous")) {
+            fs.renameSync(clonePath + ".previous", clonePath);
+          }
+          for (const x of refreshLeftovers(clonePath)) fs.rmSync(x, { recursive: true, force: true });
+          ok("  Repaired: cleaned up. The copy updates the next time you open it, or now with doctor --fix.");
+        } catch (e) {
+          err(`  Could not clean up: ${e.message}`);
+          t.problems++;
+        }
+      } else if (fix) {
+        info("  It is open now; its launcher cleans this up the next time you open it.");
+      } else {
+        info(`  Clean up with ${command("claude-multiprofile doctor --fix")}; its launcher also does on the next click.`);
         t.warnings++;
       }
     }

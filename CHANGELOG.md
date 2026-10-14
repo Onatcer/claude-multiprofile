@@ -3,6 +3,46 @@
 All notable changes to claude-multiprofile. Versions follow semver; the
 project is pre-1.0, so minor breakage may occur between 0.x releases.
 
+## 0.1.34 (2026-10-13)
+
+### Fixed
+
+- **On macOS 27, clicking a profile after a Claude update could do nothing.**
+  Reported by @picosam in #13, with two detailed traces, and hit on the
+  maintainer's own machine after upgrading to 27.0.1. The launcher started the
+  launch helper in the background and quit at once. On macOS 27, about a
+  second after an app quits, loginwindow force-quits every process that app
+  is responsible for (the system log reads `force quit (caller responsible
+  for termination)`), and the helper, started by the launcher, is one of
+  them. When the copy needed updating, the helper was killed part-way: how
+  far it got decided what was left (a half-made copy with no `Info.plist`,
+  or a tinted one never swapped in, or a swap with nothing opened), with no
+  log line and no window. When no update was needed it opened Claude fast
+  enough to beat the force-quit, which is why it only failed after updates.
+  The icon-tint fault visible in crash reports occurs on successful runs too
+  and was not the cause.
+
+  The launcher now waits for the helper to finish before it quits, so there
+  is nothing left for macOS to force-quit; Claude itself is started through
+  LaunchServices and is not the launcher's to take down. Verified with a real
+  launcher click on macOS 27.0.1: the same click that left a half-made copy
+  before now updates the copy, opens it, and logs both steps.
+
+  `upgrade` rebuilds existing launchers in place through `doctor --fix`, so
+  Dock pins keep working.
+
+### Added
+
+- **The launch helper (v2) recovers from an update that was cut off.** It
+  logs "updating the copy from X to Y" before starting, so a run that dies
+  part-way leaves a trace. The next click puts the copy back if the cut fell
+  between swapping the two copies, removes what was left behind, and opens
+  the profile; the click after that does the update. A profile never stays
+  unopenable because the last attempt died.
+- **`doctor` reports launchers that do not wait for the helper, updates that
+  were cut off, and the folders they left**, and `--fix` rebuilds the
+  launcher in place and cleans up while the profile is closed.
+
 ## 0.1.33 (2026-10-05)
 
 ### Changed
